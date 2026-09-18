@@ -1,0 +1,78 @@
+apiVersion: automation.cloudbees.io/v1alpha1
+kind: workflow
+name: Release WF
+
+# Staged release across three environments with a manual gate before STAGING.
+#
+# For Unify to recognise this as a release workflow it needs all four of:
+#   - a workflow_dispatch trigger
+#   - a required string input named `manifest`
+#   - metadata.stages/v1alpha1 defining the stages
+#   - sequential needs: dependencies between the stage jobs
+# If it does not appear as an option when creating a release, one of those is
+# missing. Allow two or three minutes for Unify to rescan.
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        type: string
+        required: true
+        description: System-generated manifest for releases
+
+metadata:
+  stages/v1alpha1:
+    - name: DEV
+      jobs:
+        - DEV
+        - Approve
+    - name: STAGING
+      jobs:
+        - STAGING
+    - name: PROD
+      jobs:
+        - PROD
+
+jobs:
+  DEV:
+    environment: DEV
+    uses: ./.cloudbees/workflows/deployer.yaml
+    vars: inherit
+    secrets: inherit
+    with:
+      manifest: ${{ inputs.manifest }}
+      environment: ${{ job.environment }}
+
+  Approve:
+    needs: DEV
+    timeout-minutes: 4320
+    delegates: cloudbees-io/manual-approval/custom-job.yml@v1
+    with:
+      disallowLaunchByUser: false
+      notifyAllEligibleUsers: false
+      # Intentionally blank so workshop attendees can approve their own release.
+      # Supports user IDs and email addresses when you want real approvers.
+      approvers: ""
+      approvalInputs: |
+        Comment:
+          type: string
+
+  STAGING:
+    needs: Approve
+    environment: STAGING
+    uses: ./.cloudbees/workflows/deployer.yaml
+    vars: inherit
+    secrets: inherit
+    with:
+      manifest: ${{ inputs.manifest }}
+      environment: ${{ job.environment }}
+
+  PROD:
+    needs: STAGING
+    environment: PROD
+    uses: ./.cloudbees/workflows/deployer.yaml
+    vars: inherit
+    secrets: inherit
+    with:
+      manifest: ${{ inputs.manifest }}
+      environment: ${{ job.environment }}

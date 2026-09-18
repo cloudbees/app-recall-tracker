@@ -1,0 +1,575 @@
+apiVersion: automation.cloudbees.io/v1alpha1
+kind: workflow
+name: Verify Setup
+
+# Configuration check. Run this before anything else.
+#
+# Every value the release needs is set in the Unify UI rather than edited into
+# files. This workflow proves each one is present AND usable, so a missing
+# kubeconfig or a wrong DockerHub token surfaces here, in a workflow whose only
+# job is to find it, rather than three modules later inside a release where the
+# error names the wrong layer.
+#
+# ---------------------------------------------------------------------------
+# TWO UNIFY RULES THIS FILE IS BUILT AROUND. Both were learned by failing.
+# ---------------------------------------------------------------------------
+#
+# 1. EVERY REFERENCED VARIABLE MUST EXIST, and cannot be empty.
+#    Referencing an undefined variable kills the workflow before any step runs:
+#
+#      failed to run workflow: evaluate "${{ vars.X }}": vars.X is undefined
+#
+#    continue-on-error does not help — the failure precedes any running step.
+#    toJSON(vars) returns {} so the context cannot be introspected either.
+#    Unify also will not SAVE a variable or secret with an empty value, so every
+#    key must hold something. An optional variable therefore needs a sentinel,
+#    and `unset` is that sentinel here.
+#
+#    Required variables:  DOCKERHUB_USER, namespace, hostname, FM_KEY,
+#                         WORKSHOP_DOMAIN
+#    Required secrets:    DOCKERHUB_TOKEN, kubeconfig, DATABASE_URL, AUTH_SECRET
+#
+# 2. EVERY REFERENCED STEP OUTPUT MUST BE WRITTEN ON EVERY PATH.
+#    An output key that was never written is undefined, not empty:
+#
+#      evaluate "${{ steps.database.outputs.result }}": ... is undefined,
+#      supported steps.database.outputs fields: fail
+#
+#    So `outputs.result != ''` cannot defend against a missing key — the
+#    evaluation fails first, taking the summary and the evidence with it.
+#
+#    Hence finish() in every check below. It is the ONLY exit path, it always
+#    writes `result`, and every branch routes through it. Do not add a bare
+#    `exit` to any of these steps.
+#
+#    Belt and braces: readers ALSO treat an empty result as FAIL. Writing the key
+#    makes it defined; a step that then exits non-zero appears to lose the VALUE.
+#    Both defences are needed — the key guards against a fatal evaluation, the
+#    empty check guards against a blank cell reading as success.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options:
+          - DEV
+          - STAGING
+          - PROD
+        default: DEV
+        description: >-
+          Which environment to verify. Configuration is scoped per environment, so
+          each one must be checked separately — DEV passing says nothing about
+          STAGING.
+
+permissions:
+  scm-token-own: read
+  scm-token-org: read
+  id-token: read
+
+jobs:
+  verify:
+    # Required, not decorative. namespace, hostname, kubeconfig and FM_KEY are set
+    # per environment, and environment-scoped values do NOT layer over
+    # organization-level ones — they are simply invisible to a job that declares no
+    # environment. Without this line the workflow dies at dispatch with:
+    #
+    #   evaluate "${{ vars.namespace }}": vars.namespace is undefined,
+    #   supported vars fields: DOCKERHUB_USER, FM_KEY, hostname
+    #
+    # which names the variable but not the reason.
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Check required variables
+        id: vars
+        continue-on-error: true
+        uses: docker://alpine:latest
+        env:
+          V_DOCKERHUB_USER: ${{ vars.DOCKERHUB_USER }}
+          V_NAMESPACE: ${{ vars.namespace }}
+          V_HOSTNAME: ${{ vars.hostname }}
+          V_FM_KEY: ${{ vars.FM_KEY }}
+          # The same expression ai-service and core-api use to map the sentinel to
+          # an empty string. Evaluated here so a wrong result shows up as a failed
+          # check rather than as an SDK authentication error inside a release.
+          V_FM_MAPPED: ${{ vars.FM_KEY != 'unset' && vars.FM_KEY || '' }}
+          V_S3_BUCKET: ${{ vars.S3_BUCKET }}
+          # Set once by the facilitator at the parent organization, so every
+          # attendee inherits it. It is what lets the hostname check say a
+          # hostname is WRONG rather than merely malformed.
+          V_WORKSHOP_DOMAIN: ${{ vars.WORKSHOP_DOMAIN }}
+          V_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          # Single exit path, so `result` is always written. See rule 2 in the
+          # header. FAIL also exits non-zero, which is what marks the step red in
+          # the run view; continue-on-error keeps the job going.
+          finish() {
+            echo -n "$1" >> $CLOUDBEES_OUTPUTS/result
+            if [ "$1" = "FAIL" ]; then RC=1; else RC=0; fi
+            echo -n "$RC" >> $CLOUDBEES_OUTPUTS/fail
+            exit $RC
+          }
+
+          FAIL=0
+          WARN=0
+
+          # Checked one at a time, by value, on purpose. Two earlier versions
+          # looped over variable NAMES and dereferenced them with eval. Both
+          # misbehaved under Unify's runner in ways that could not be reproduced in
+          # bash, dash or busybox sh: the second reported each variable's own name
+          # as its value, so nothing could ever be empty and EVERY CHECK PASSED
+          # UNCONDITIONALLY. A check that cannot fail is worse than no check.
+          req() {
+            if [ -z "$2" ]; then
+              echo "  MISSING  $1"
+              FAIL=1
+            else
+              echo "  ok       $1 = $2"
+            fi
+          }
+
+          echo "=== Variables (environment: $V_ENVIRONMENT) ==="
+          req DOCKERHUB_USER "$V_DOCKERHUB_USER"
+          req namespace      "$V_NAMESPACE"
+          req hostname       "$V_HOSTNAME"
+
+          # Presence is not enough. The hostname must sit inside the wildcard
+          # certificate the facilitator issued, which covers exactly one label:
+          #   <name>.$WORKSHOP_DOMAIN
+          #
+          # An earlier version hardcoded that suffix and failed every workshop whose
+          # domain was not the one it was written against. A facilitator-set
+          # WORKSHOP_DOMAIN lets this say a hostname is WRONG rather than merely
+          # malformed, which is the mistake attendees actually make.
+          if [ -z "$V_WORKSHOP_DOMAIN" ]; then
+            echo "  MISSING  WORKSHOP_DOMAIN"
+            echo "           Set by your facilitator at the parent organization."
+            echo "           Ask them - this one is not yours to fix."
+            FAIL=1
+          else
+            echo "  ok       WORKSHOP_DOMAIN = $V_WORKSHOP_DOMAIN"
+          fi
+
+          if [ -n "$V_HOSTNAME" ]; then
+            case "$V_HOSTNAME" in
+              *[A-Z]*)
+                echo "  FAILED   hostname must be lowercase."
+                echo "           Kubernetes rejects an Ingress host with uppercase."
+                FAIL=1 ;;
+            esac
+            case "$V_HOSTNAME" in
+              http://*|https://*|*/*)
+                echo "  FAILED   hostname must be a bare host, with no scheme or path."
+                echo "           Got: $V_HOSTNAME"
+                FAIL=1 ;;
+            esac
+            # Only meaningful once the domain is known; skipped rather than guessed.
+            if [ -n "$V_WORKSHOP_DOMAIN" ]; then
+              case "$V_HOSTNAME" in
+                *".$V_WORKSHOP_DOMAIN")
+                  # A wildcard certificate covers one level, so exactly one label may
+                  # sit in front of the domain. sean-dev.<domain> is fine;
+                  # a.sean-dev.<domain> is not, and fails only in the browser.
+                  case "${V_HOSTNAME%.$V_WORKSHOP_DOMAIN}" in
+                    ""|*.*)
+                      echo "  FAILED   hostname must be exactly one label in front of"
+                      echo "           .$V_WORKSHOP_DOMAIN - the certificate is a wildcard,"
+                      echo "           and a wildcard covers one level only."
+                      echo "           Got: $V_HOSTNAME"
+                      FAIL=1 ;;
+                  esac ;;
+                *)
+                  echo "  FAILED   hostname must end in .$V_WORKSHOP_DOMAIN"
+                  echo "           Got: $V_HOSTNAME"
+                  echo "           Anything else is outside the wildcard certificate"
+                  echo "           and will fail TLS when you open the app."
+                  FAIL=1 ;;
+              esac
+            fi
+          fi
+
+          if [ -z "$V_S3_BUCKET" ] || [ "$V_S3_BUCKET" = "unset" ]; then
+            echo "  warn     S3_BUCKET is not set."
+            echo "           Document upload and export to S3 will not work."
+            echo "           Expected: the workshop does not provision S3."
+            WARN=1
+          else
+            echo "  ok       S3_BUCKET = $V_S3_BUCKET"
+          fi
+
+          if [ -z "$V_FM_KEY" ] || [ "$V_FM_KEY" = "unset" ]; then
+            echo "  warn     FM_KEY is not set yet."
+            echo "           Flags fall back to code defaults, which are OFF."
+            echo "           Modules 01-06 work without it. Module 07 needs it."
+            WARN=1
+            if [ -z "$V_FM_MAPPED" ]; then
+              echo "  ok       the sentinel maps to empty for the deploy workflows"
+            else
+              echo "  FAILED   the sentinel did NOT map to empty (got '$V_FM_MAPPED')."
+              echo "           ai-service and core-api would receive that literal"
+              echo "           value and fail SDK authentication."
+              FAIL=1
+            fi
+          else
+            echo "  ok       FM_KEY is set"
+            if [ "$V_FM_MAPPED" = "$V_FM_KEY" ]; then
+              echo "  ok       it passes through to the deploy workflows unchanged"
+            else
+              echo "  FAILED   a real FM_KEY is being altered on the way through."
+              FAIL=1
+            fi
+          fi
+
+          if [ "$FAIL" = "1" ]; then finish FAIL
+          elif [ "$WARN" = "1" ]; then finish WARN
+          else finish PASS
+          fi
+
+      - name: Check required secrets are present
+        id: secrets
+        continue-on-error: true
+        uses: docker://alpine:latest
+        env:
+          S_DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          S_KUBECONFIG: ${{ secrets.kubeconfig }}
+          S_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          S_AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
+          S_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          S_VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+          S_ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          S_LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
+          S_FDA_API_KEY: ${{ secrets.FDA_API_KEY }}
+        run: |
+          finish() {
+            echo -n "$1" >> $CLOUDBEES_OUTPUTS/result
+            if [ "$1" = "FAIL" ]; then RC=1; else RC=0; fi
+            echo -n "$RC" >> $CLOUDBEES_OUTPUTS/fail
+            exit $RC
+          }
+
+          FAIL=0
+          WARN=0
+
+          # Explicit, for the reason given in the variables check. Lengths are
+          # reported because they catch the most common mistake: pasting a file's
+          # path instead of its contents.
+          sec() {
+            if [ -z "$2" ]; then
+              echo "  MISSING  $1"
+              FAIL=1
+            else
+              echo "  ok       $1 is set (${#2} chars)"
+            fi
+          }
+
+          echo "=== Secrets (values never printed) ==="
+          sec DOCKERHUB_TOKEN "$S_DOCKERHUB_TOKEN"
+          sec kubeconfig      "$S_KUBECONFIG"
+          sec DATABASE_URL    "$S_DATABASE_URL"
+          sec AUTH_SECRET     "$S_AUTH_SECRET"
+
+          # Optional secrets. They must EXIST, because an undefined secret is fatal
+          # at evaluation — the release fails in whichever component references it,
+          # with an error naming the secret and an empty "supported fields" list.
+          # Set them to the sentinel `unset` until you have real values; the deploy
+          # workflows map that to empty so each service takes its no-key path.
+          opt() {
+            if [ -z "$2" ] || [ "$2" = "unset" ]; then
+              echo "  warn     $1 is not set."
+              echo "           $3"
+              WARN=1
+            else
+              echo "  ok       $1 is set (${#2} chars)"
+            fi
+          }
+          opt ANTHROPIC_API_KEY "$S_ANTHROPIC_API_KEY" \
+            "Discovery quality suffers and the Recall Advisor cannot answer."
+          opt VOYAGE_API_KEY    "$S_VOYAGE_API_KEY" \
+            "Embeddings are unavailable, so semantic search returns nothing."
+          opt ADMIN_PASSWORD    "$S_ADMIN_PASSWORD" \
+            "The admin endpoints stay disabled. Expected: the workshop does not use them."
+          opt FDA_API_KEY       "$S_FDA_API_KEY" \
+            "openFDA limits you to 1,000 requests/day for the whole cohort."
+          opt LOGIN_PASSWORD     "$S_LOGIN_PASSWORD" \
+            "No demo accounts are created; attendees must register before Module 06."
+
+          # A base64 kubeconfig is thousands of characters. A few dozen means the
+          # file PATH was pasted instead of its CONTENTS - the single most common
+          # setup mistake, and one that otherwise surfaces as "not valid base64".
+          if [ -n "$S_KUBECONFIG" ] && [ "${#S_KUBECONFIG}" -lt 500 ]; then
+            echo "  FAILED   kubeconfig is only ${#S_KUBECONFIG} characters."
+            echo "           That looks like a file path, not its contents. Use:"
+            echo "             ./infra/copy-to-clipboard.sh out/<attendee>-kubeconfig.b64"
+            FAIL=1
+          fi
+
+          # AUTH_SECRET signs NextAuth session cookies. A short value is a valid
+          # string and a weak key, so presence alone is not enough.
+          if [ -n "$S_AUTH_SECRET" ] && [ "${#S_AUTH_SECRET}" -lt 32 ]; then
+            echo "  warn     AUTH_SECRET is only ${#S_AUTH_SECRET} characters."
+            echo "           Use at least 32:  openssl rand -base64 32"
+            WARN=1
+          fi
+
+          if [ "$FAIL" = "1" ]; then finish FAIL
+          elif [ "$WARN" = "1" ]; then finish WARN
+          else finish PASS
+          fi
+
+      - name: Check DockerHub credentials work
+        id: dockerhub
+        continue-on-error: true
+        uses: docker://alpine:latest
+        env:
+          DH_USER: ${{ vars.DOCKERHUB_USER }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          finish() {
+            echo -n "$1" >> $CLOUDBEES_OUTPUTS/result
+            if [ "$1" = "FAIL" ]; then RC=1; else RC=0; fi
+            echo -n "$RC" >> $CLOUDBEES_OUTPUTS/fail
+            exit $RC
+          }
+
+          # Authenticates against the registry token endpoint rather than using
+          # configure-oci-credentials, so this step reports its own result.
+          apk add --no-cache curl >/dev/null 2>&1
+          echo "=== DockerHub ==="
+          if [ -z "$DH_USER" ] || [ -z "$DH_TOKEN" ]; then
+            echo "  SKIP     DOCKERHUB_USER or DOCKERHUB_TOKEN not set"
+            finish FAIL
+          fi
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -u "$DH_USER:$DH_TOKEN" \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$DH_USER/recall-web-ui:pull,push")
+          if [ "$CODE" = "200" ]; then
+            echo "  ok       credentials accepted for $DH_USER"
+            finish PASS
+          fi
+          echo "  FAILED   registry auth returned HTTP $CODE"
+          echo "           Check DOCKERHUB_USER matches the account and that"
+          echo "           DOCKERHUB_TOKEN is an access token, not a password."
+          finish FAIL
+
+      - name: Check cluster is reachable
+        id: cluster
+        continue-on-error: true
+        uses: docker://bitnami/kubectl:latest
+        env:
+          KCFG_B64: ${{ secrets.kubeconfig }}
+          NS: ${{ vars.namespace }}
+        run: |
+          finish() {
+            echo -n "$1" >> $CLOUDBEES_OUTPUTS/result
+            if [ "$1" = "FAIL" ]; then RC=1; else RC=0; fi
+            echo -n "$RC" >> $CLOUDBEES_OUTPUTS/fail
+            exit $RC
+          }
+
+          FAIL=0
+          echo "=== Cluster ==="
+          if [ -z "$KCFG_B64" ]; then
+            echo "  SKIP     kubeconfig not set"
+            finish FAIL
+          fi
+
+          umask 077
+          mkdir -p /tmp/.kube
+          printf '%s' "$KCFG_B64" | tr -d '\r\n ' | base64 -d > /tmp/.kube/config 2>/dev/null || {
+            echo "  FAILED   kubeconfig did not decode as base64 (${#KCFG_B64} characters)"
+            finish FAIL
+          }
+          export KUBECONFIG=/tmp/.kube/config
+
+          if kubectl version --request-timeout=15s >/dev/null 2>&1; then
+            echo "  ok       cluster reachable"
+          else
+            echo "  FAILED   cannot reach cluster with this kubeconfig"
+            FAIL=1
+          fi
+
+          # Do NOT use `kubectl get namespace`. Namespaces are cluster-scoped and
+          # the attendee's kubeconfig is bound to a namespace-scoped Role, so that
+          # call is forbidden even when the namespace exists and is writable. It
+          # reported "not found" for a namespace this workflow had just created a
+          # pod in. auth can-i uses SelfSubjectAccessReview, which any authenticated
+          # user may call, and it tests the permission Helm actually needs.
+          if [ "$(kubectl auth can-i create deployments -n "$NS" 2>/dev/null)" = "yes" ]; then
+            echo "  ok       can deploy into namespace $NS"
+          else
+            echo "  FAILED   cannot create deployments in namespace '$NS'"
+            echo "           Either the namespace does not exist, or this kubeconfig"
+            echo "           is not bound to it. Check vars.namespace matches the"
+            echo "           namespace the kubeconfig was generated for."
+            FAIL=1
+          fi
+
+          if [ "$FAIL" = "1" ]; then finish FAIL; else finish PASS; fi
+
+      - name: Check database is reachable
+        id: database
+        continue-on-error: true
+        uses: docker://bitnami/kubectl:latest
+        env:
+          KCFG_B64: ${{ secrets.kubeconfig }}
+          NS: ${{ vars.namespace }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          finish() {
+            echo -n "$1" >> $CLOUDBEES_OUTPUTS/result
+            if [ "$1" = "FAIL" ]; then RC=1; else RC=0; fi
+            echo -n "$RC" >> $CLOUDBEES_OUTPUTS/fail
+            exit $RC
+          }
+
+          # Runs INSIDE the cluster, not from this container. PostgreSQL is a
+          # ClusterIP service in the attendee's namespace, so its hostname does not
+          # resolve anywhere outside the cluster. An earlier version ran psql here
+          # and could never have passed - it reported "cannot connect" for a healthy
+          # database. Testing from inside also exercises the path the application
+          # actually uses.
+          #
+          # This check therefore needs kubeconfig and namespace as well as
+          # DATABASE_URL. If the cluster check failed, expect this to fail too.
+          echo "=== Database ==="
+          if [ -z "$KCFG_B64" ] || [ -z "$NS" ] || [ -z "$DATABASE_URL" ]; then
+            echo "  SKIP     needs kubeconfig, namespace and DATABASE_URL"
+            finish FAIL
+          fi
+
+          umask 077
+          mkdir -p /tmp/.kube
+          printf '%s' "$KCFG_B64" | tr -d '\r\n ' | base64 -d > /tmp/.kube/config 2>/dev/null || {
+            echo "  FAILED   kubeconfig did not decode - see the cluster check above"
+            finish FAIL
+          }
+          export KUBECONFIG=/tmp/.kube/config
+
+          POD=$(echo "verify-db-${CLOUDBEES_RUN_ID:-manual}" | tr -cd 'a-z0-9-' | cut -c1-60)
+          trap 'kubectl delete pod "$POD" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true' EXIT
+
+          # BOTH the URL and the SQL travel by environment variable, so the inner
+          # `sh -c` contains no quoting of its own. An earlier version inlined the
+          # query and used PostgreSQL dollar-quoting ($$vector$$) to avoid nesting
+          # single quotes; that silently broke, because `$$` inside DOUBLE quotes is
+          # expanded by the shell to its own PID. psql received `where name = 12345`,
+          # errored, and `|| true` hid it - reporting pgvector as unavailable on a
+          # server that had 0.8.6.
+          #
+          # DATABASE_URL is passed as an env var rather than an argument so it does
+          # not appear in the pod's command. It is still visible in the pod's env to
+          # anyone with access to this namespace, which is the attendee.
+          kubectl run "$POD" -n "$NS" --restart=Never --image=postgres:16-alpine \
+            --env="PGURL=$DATABASE_URL" \
+            --env="SQL=select coalesce((select default_version from pg_available_extensions where name='vector'),'none')" \
+            --command -- \
+            sh -c 'psql "$PGURL" -tAc "$SQL" && echo CONNECTED || echo REFUSED' \
+            >/dev/null 2>&1 || {
+              echo "  FAILED   could not create a pod in namespace '$NS'"
+              echo "           The kubeconfig may lack permission to create pods."
+              finish FAIL
+            }
+
+          kubectl wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$POD" -n "$NS" --timeout=120s >/dev/null 2>&1 || true
+          OUT=$(kubectl logs "$POD" -n "$NS" 2>/dev/null || true)
+
+          case "$OUT" in
+            *CONNECTED*)
+              echo "  ok       connected from inside the cluster"
+              VEC=$(echo "$OUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+              if [ -n "$VEC" ]; then
+                echo "  ok       pgvector $VEC available"
+                finish PASS
+              elif echo "$OUT" | grep -q none; then
+                echo "  FAILED   pgvector is not available on this server."
+                echo "           The image must be pgvector/pgvector, not postgres."
+                finish FAIL
+              else
+                echo "  warn     could not determine the pgvector version"
+                finish WARN
+              fi
+              ;;
+            *REFUSED*)
+              echo "  FAILED   the database refused the connection."
+              echo "           DATABASE_URL should be:"
+              echo "             postgresql://recall:<password>@postgres:5432/recall"
+              echo "           Check the password matches the one the namespace was"
+              echo "           provisioned with."
+              finish FAIL
+              ;;
+            *)
+              echo "  FAILED   the check pod produced no result within 120s."
+              echo "           Inspect with: kubectl -n $NS describe pod $POD"
+              finish FAIL
+              ;;
+          esac
+
+      - name: Summary
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          VARS_RESULT: ${{ steps.vars.outputs.result }}
+          SECRETS_RESULT: ${{ steps.secrets.outputs.result }}
+          DOCKER_RESULT: ${{ steps.dockerhub.outputs.result }}
+          CLUSTER_RESULT: ${{ steps.cluster.outputs.result }}
+          DB_RESULT: ${{ steps.database.outputs.result }}
+        uses: docker://alpine:latest
+        run: |
+          echo "=================================="
+          echo "  Setup verification summary"
+          echo "  environment: $ENVIRONMENT"
+          echo "=================================="
+
+          # Default to FAIL. Every check writes `result` on every path, so an empty
+          # value here means something unexpected happened, and an unexplained
+          # result must never read as a pass.
+          BAD=0
+          WARNED=0
+          row() {
+            r="${2:-FAIL}"
+            printf '  %-5s %s\n' "$r" "$1"
+            [ "$r" = "FAIL" ] && BAD=1
+            [ "$r" = "WARN" ] && WARNED=1
+            return 0
+          }
+          row variables "$VARS_RESULT"
+          row secrets   "$SECRETS_RESULT"
+          row dockerhub "$DOCKER_RESULT"
+          row cluster   "$CLUSTER_RESULT"
+          row database  "$DB_RESULT"
+          echo
+          if [ "$BAD" = "1" ]; then
+            echo "Setup is incomplete. Fix the items above in the Unify UI"
+            echo "(Configurations > Properties), then run this again."
+            exit 1
+          fi
+          if [ "$WARNED" = "1" ]; then
+            echo "Setup is usable, with warnings. Read the WARN lines above before"
+            echo "continuing - each names the module where it starts to matter."
+            exit 0
+          fi
+          echo "Setup is complete. Continue to the next module."
+
+      - name: Publish setup evidence
+        if: always()
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: |-
+            ## Setup verification
+
+            | Check | Result |
+            |---|---|
+            | Variables | ${{ steps.vars.outputs.result != '' && steps.vars.outputs.result || 'FAIL' }} |
+            | Secrets | ${{ steps.secrets.outputs.result != '' && steps.secrets.outputs.result || 'FAIL' }} |
+            | DockerHub | ${{ steps.dockerhub.outputs.result != '' && steps.dockerhub.outputs.result || 'FAIL' }} |
+            | Cluster | ${{ steps.cluster.outputs.result != '' && steps.cluster.outputs.result || 'FAIL' }} |
+            | Database | ${{ steps.database.outputs.result != '' && steps.database.outputs.result || 'FAIL' }} |
+
+            Warnings do not fail setup, so they are stated here too — otherwise the
+            evidence reads as a clean bill of health while something is outstanding.
+
+            | Setting | Value |
+            |---|---|
+            | Environment | ${{ inputs.environment }} |
+            | Namespace | ${{ vars.namespace }} |
+            | Hostname | ${{ vars.hostname }} |
+            | Feature Management | ${{ vars.FM_KEY != 'unset' && 'configured' || '**not configured** — expected until Module 07' }} |
+          format: MARKDOWN

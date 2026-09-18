@@ -1,0 +1,161 @@
+apiVersion: automation.cloudbees.io/v1alpha1
+kind: workflow
+name: deployer
+
+# Calls each component's deploy.yaml in dependency order, driven by a
+# release manifest.
+#
+# BEFORE USING: replace every occurrence of YOUR-GITHUB-ORG below with the account you
+# copied the template repositories into. Find-and-replace is safest: there are ten, a
+# `uses:` and a `component-repo:` for each of the five components. That is the only
+# edit this file needs.
+#
+# MATCH GITHUB'S CASING EXACTLY. These deploy workflows declare `environment:`, and a
+# reusable workflow bound to an environment may only be called from within the same SCM
+# organization -- compared as a literal string. `acmecorp` and `AcmeCorp` are the same
+# account to GitHub and two different organizations to that check, which fails the
+# release before any step runs. DOCKERHUB_USER is lowercase by DockerHub convention and
+# is NOT necessarily the same spelling as your GitHub account.
+#
+# The originals live at https://github.com/cloudbees — but `uses:` must point at YOUR
+# copies, not the templates, or you would be deploying somebody else's build.
+#
+# Everything else comes from Unify variables set in the UI -- DOCKERHUB_USER
+# here, plus namespace, hostname and the secrets used by each component's
+# deploy.yaml. Run the "Verify Setup" workflow first to confirm they are all
+# present and working.
+#
+# `uses:` cannot be templated: the workflow graph is resolved before any
+# expression is evaluated, so the repository path has to be literal. That is why
+# these five remain manual while everything else moved to variables.
+#
+# Only two dependencies are real; the rest deploy in parallel.
+#
+#   DB  ->  Worker, AI-Service, Core-API   (all three query the migrated schema;
+#                                           helm waits for readiness, and a pod
+#                                           that cannot find its tables fails it)
+#   Core-API  ->  Web-UI                   (web-ui owns the Ingress that routes
+#                                           /api to core-api, so deploying it
+#                                           first leaves a window where the site
+#                                           is up and every API call 503s)
+#
+# Web-UI does not touch the database directly, so it needs Core-API rather than DB.
+# An earlier version chained all five in series, which was conservative rather than
+# correct: it added roughly three sequential deploys per stage, times three stages,
+# for no ordering guarantee anyone needed.
+#
+# The if: guard lets a release deploy only the components present in the
+# manifest, so a single-component fix does not redeploy everything.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      manifest:
+        type: string
+        required: true
+
+permissions:
+  scm-token-own: read
+  scm-token-org: read
+
+jobs:
+  # Prints the manifest before anything is deployed.
+  #
+  # Every `if:` guard below indexes this structure by component name and by
+  # artifact name. If either key is wrong the guard cannot match, and a wrong
+  # component name is easy to create by accident in the Unify UI. Without this
+  # job the symptom is a green release that deployed nothing, which is the worst
+  # possible failure for a workshop.
+  #
+  # Deliberately does not index the manifest: it echoes the raw string. Whether
+  # indexing a MISSING key is falsey or fatal is not established, and finding out
+  # inside a guard would take the release down before this could report anything.
+  manifest:
+    steps:
+      - name: Show the release manifest
+        uses: docker://alpine:latest
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          DOCKERHUB_USER: ${{ vars.DOCKERHUB_USER }}
+        run: |
+          echo "=== Deploying to: $ENVIRONMENT ==="
+          echo
+          echo "Components are matched by name, and artifacts by"
+          echo "docker.io/$DOCKERHUB_USER/<component>. Both must match exactly."
+          echo
+          echo "Expected component keys:"
+          for c in recall-db recall-worker recall-ai-service recall-core-api recall-web-ui; do
+            if echo "$MANIFEST" | grep -q "\"$c\""; then
+              echo "  present  $c"
+            else
+              echo "  ABSENT   $c  <- this component will NOT be deployed"
+            fi
+          done
+          echo
+          echo "=== Raw manifest ==="
+          echo "$MANIFEST"
+
+  DB:
+    needs: [manifest]
+    # First in the chain: migrations must land before anything starts.
+    if: ${{ fromJSON(inputs.manifest)['recall-db'][format('docker.io/{0}/recall-db', vars.DOCKERHUB_USER)].deploy }}
+    uses: cloudbees/recall-db/.cloudbees/workflows/deploy.yaml
+    vars: inherit
+    secrets: inherit
+    with:
+      artifact-id: ${{ fromJSON(inputs.manifest)['recall-db'][format('docker.io/{0}/recall-db', vars.DOCKERHUB_USER)].id }}
+      version: ${{ fromJSON(inputs.manifest)['recall-db'][format('docker.io/{0}/recall-db', vars.DOCKERHUB_USER)].version }}
+      environment: ${{ inputs.environment }}
+      component-repo: https://github.com/cloudbees/recall-db.git
+
+  Worker:
+    needs: [DB]
+    if: ${{ fromJSON(inputs.manifest)['recall-worker'][format('docker.io/{0}/recall-worker', vars.DOCKERHUB_USER)].deploy }}
+    uses: cloudbees/recall-worker/.cloudbees/workflows/deploy.yaml
+    vars: inherit
+    secrets: inherit
+    with:
+      artifact-id: ${{ fromJSON(inputs.manifest)['recall-worker'][format('docker.io/{0}/recall-worker', vars.DOCKERHUB_USER)].id }}
+      version: ${{ fromJSON(inputs.manifest)['recall-worker'][format('docker.io/{0}/recall-worker', vars.DOCKERHUB_USER)].version }}
+      environment: ${{ inputs.environment }}
+      component-repo: https://github.com/cloudbees/recall-worker.git
+
+  AI-Service:
+    needs: [DB]
+    if: ${{ fromJSON(inputs.manifest)['recall-ai-service'][format('docker.io/{0}/recall-ai-service', vars.DOCKERHUB_USER)].deploy }}
+    uses: cloudbees/recall-ai-service/.cloudbees/workflows/deploy.yaml
+    vars: inherit
+    secrets: inherit
+    with:
+      artifact-id: ${{ fromJSON(inputs.manifest)['recall-ai-service'][format('docker.io/{0}/recall-ai-service', vars.DOCKERHUB_USER)].id }}
+      version: ${{ fromJSON(inputs.manifest)['recall-ai-service'][format('docker.io/{0}/recall-ai-service', vars.DOCKERHUB_USER)].version }}
+      environment: ${{ inputs.environment }}
+      component-repo: https://github.com/cloudbees/recall-ai-service.git
+
+  Core-API:
+    needs: [DB]
+    if: ${{ fromJSON(inputs.manifest)['recall-core-api'][format('docker.io/{0}/recall-core-api', vars.DOCKERHUB_USER)].deploy }}
+    uses: cloudbees/recall-core-api/.cloudbees/workflows/deploy.yaml
+    vars: inherit
+    secrets: inherit
+    with:
+      artifact-id: ${{ fromJSON(inputs.manifest)['recall-core-api'][format('docker.io/{0}/recall-core-api', vars.DOCKERHUB_USER)].id }}
+      version: ${{ fromJSON(inputs.manifest)['recall-core-api'][format('docker.io/{0}/recall-core-api', vars.DOCKERHUB_USER)].version }}
+      environment: ${{ inputs.environment }}
+      component-repo: https://github.com/cloudbees/recall-core-api.git
+
+  Web-UI:
+    needs: [Core-API]
+    if: ${{ fromJSON(inputs.manifest)['recall-web-ui'][format('docker.io/{0}/recall-web-ui', vars.DOCKERHUB_USER)].deploy }}
+    uses: cloudbees/recall-web-ui/.cloudbees/workflows/deploy.yaml
+    vars: inherit
+    secrets: inherit
+    with:
+      artifact-id: ${{ fromJSON(inputs.manifest)['recall-web-ui'][format('docker.io/{0}/recall-web-ui', vars.DOCKERHUB_USER)].id }}
+      version: ${{ fromJSON(inputs.manifest)['recall-web-ui'][format('docker.io/{0}/recall-web-ui', vars.DOCKERHUB_USER)].version }}
+      environment: ${{ inputs.environment }}
+      component-repo: https://github.com/cloudbees/recall-web-ui.git
