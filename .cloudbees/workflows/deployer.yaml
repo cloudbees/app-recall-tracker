@@ -103,59 +103,59 @@ jobs:
     needs: [manifest]
     # First in the chain: migrations must land before anything starts.
     if: ${{ fromJSON(inputs.manifest)['recall-db'][format('docker.io/{0}/recall-db', vars.DOCKERHUB_USER)].deploy }}
-    uses: cloudbees/recall-db/.cloudbees/workflows/deploy.yaml
+    uses: YOUR-GITHUB-ORG/recall-db/.cloudbees/workflows/deploy.yaml
     vars: inherit
     secrets: inherit
     with:
       artifact-id: ${{ fromJSON(inputs.manifest)['recall-db'][format('docker.io/{0}/recall-db', vars.DOCKERHUB_USER)].id }}
       version: ${{ fromJSON(inputs.manifest)['recall-db'][format('docker.io/{0}/recall-db', vars.DOCKERHUB_USER)].version }}
       environment: ${{ inputs.environment }}
-      component-repo: https://github.com/cloudbees/recall-db.git
+      component-repo: https://github.com/YOUR-GITHUB-ORG/recall-db.git
 
   Worker:
     needs: [DB]
     if: ${{ fromJSON(inputs.manifest)['recall-worker'][format('docker.io/{0}/recall-worker', vars.DOCKERHUB_USER)].deploy }}
-    uses: cloudbees/recall-worker/.cloudbees/workflows/deploy.yaml
+    uses: YOUR-GITHUB-ORG/recall-worker/.cloudbees/workflows/deploy.yaml
     vars: inherit
     secrets: inherit
     with:
       artifact-id: ${{ fromJSON(inputs.manifest)['recall-worker'][format('docker.io/{0}/recall-worker', vars.DOCKERHUB_USER)].id }}
       version: ${{ fromJSON(inputs.manifest)['recall-worker'][format('docker.io/{0}/recall-worker', vars.DOCKERHUB_USER)].version }}
       environment: ${{ inputs.environment }}
-      component-repo: https://github.com/cloudbees/recall-worker.git
+      component-repo: https://github.com/YOUR-GITHUB-ORG/recall-worker.git
 
   AI-Service:
     needs: [DB]
     if: ${{ fromJSON(inputs.manifest)['recall-ai-service'][format('docker.io/{0}/recall-ai-service', vars.DOCKERHUB_USER)].deploy }}
-    uses: cloudbees/recall-ai-service/.cloudbees/workflows/deploy.yaml
+    uses: YOUR-GITHUB-ORG/recall-ai-service/.cloudbees/workflows/deploy.yaml
     vars: inherit
     secrets: inherit
     with:
       artifact-id: ${{ fromJSON(inputs.manifest)['recall-ai-service'][format('docker.io/{0}/recall-ai-service', vars.DOCKERHUB_USER)].id }}
       version: ${{ fromJSON(inputs.manifest)['recall-ai-service'][format('docker.io/{0}/recall-ai-service', vars.DOCKERHUB_USER)].version }}
       environment: ${{ inputs.environment }}
-      component-repo: https://github.com/cloudbees/recall-ai-service.git
+      component-repo: https://github.com/YOUR-GITHUB-ORG/recall-ai-service.git
 
   Core-API:
     needs: [DB]
     if: ${{ fromJSON(inputs.manifest)['recall-core-api'][format('docker.io/{0}/recall-core-api', vars.DOCKERHUB_USER)].deploy }}
-    uses: cloudbees/recall-core-api/.cloudbees/workflows/deploy.yaml
+    uses: YOUR-GITHUB-ORG/recall-core-api/.cloudbees/workflows/deploy.yaml
     vars: inherit
     secrets: inherit
     with:
       artifact-id: ${{ fromJSON(inputs.manifest)['recall-core-api'][format('docker.io/{0}/recall-core-api', vars.DOCKERHUB_USER)].id }}
       version: ${{ fromJSON(inputs.manifest)['recall-core-api'][format('docker.io/{0}/recall-core-api', vars.DOCKERHUB_USER)].version }}
       environment: ${{ inputs.environment }}
-      component-repo: https://github.com/cloudbees/recall-core-api.git
+      component-repo: https://github.com/YOUR-GITHUB-ORG/recall-core-api.git
 
   Web-UI:
     needs: [Core-API]
     if: ${{ fromJSON(inputs.manifest)['recall-web-ui'][format('docker.io/{0}/recall-web-ui', vars.DOCKERHUB_USER)].deploy }}
-    uses: cloudbees/recall-web-ui/.cloudbees/workflows/deploy.yaml
+    uses: YOUR-GITHUB-ORG/recall-web-ui/.cloudbees/workflows/deploy.yaml
     vars: inherit
     secrets: inherit
     with:
       artifact-id: ${{ fromJSON(inputs.manifest)['recall-web-ui'][format('docker.io/{0}/recall-web-ui', vars.DOCKERHUB_USER)].id }}
       version: ${{ fromJSON(inputs.manifest)['recall-web-ui'][format('docker.io/{0}/recall-web-ui', vars.DOCKERHUB_USER)].version }}
       environment: ${{ inputs.environment }}
-      component-repo: https://github.com/cloudbees/recall-web-ui.git
+      component-repo: https://github.com/YOUR-GITHUB-ORG/recall-web-ui.git
